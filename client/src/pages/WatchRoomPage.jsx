@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { clearRoomSession, loadRoomSession, participantId, saveRoomSession } from '../roomSession.js'
 import { extractYoutubeVideoId, loadYoutubeIframeApi } from '../youtubeIframeApi.js'
+import { getPlaybackCommandForPlayerState, getSeekCorrection } from '../playbackSync.js'
 
 function Icon({ name }) {
   const paths = {
@@ -69,8 +70,8 @@ export default function WatchRoomPage({ socket, connection }) {
   const remoteApplyRef = useRef(false)
   const remoteApplyTimerRef = useRef(null)
   const currentPlayerVideoRef = useRef('')
-  const lastHostActionRef = useRef('')
-  const lastHostTimeRef = useRef({ time: 0, at: 0 })
+  const lastSeekCorrectionRef = useRef(null)
+  const lastHostTimeRef = useRef({ time: 0, at: Date.now() })
   const chatListRef = useRef(null)
   const isHost = participant?.role === 'Host'
   const canControlPlayback = isHost || participant?.role === 'Moderator'
@@ -128,9 +129,38 @@ export default function WatchRoomPage({ socket, connection }) {
 
   function emitHostControl(event, payload) {
     if (!canControlPlaybackRef.current || !socket?.connected) return
+    const previous = pendingVideoStateRef.current || { videoId: activeVideoId, currentTime: 0, playing: false }
+    const next = { ...previous, ...payload, updatedAt: Date.now() }
+    if (event === 'play') next.playing = true
+    else if (event === 'pause') next.playing = false
+    pendingVideoStateRef.current = next
     socket.timeout(5000).emit(event, payload, (timeoutError, result) => {
       if (timeoutError || result?.error) setVideoError(result?.error || 'The server did not confirm the playback update.')
     })
+  }
+
+  function seekToTarget(player, videoId, targetTime) {
+    const currentTime = player.getCurrentTime?.()
+    const playerState = player.getPlayerState?.()
+    const correction = getSeekCorrection({
+      videoId,
+      currentTime,
+      targetTime,
+      playerState,
+      ready: playerReadyRef.current,
+      lastCorrection: lastSeekCorrectionRef.current,
+      now: Date.now(),
+    })
+    if (!correction) {
+      if (Number.isFinite(currentTime) && Math.abs(currentTime - targetTime) <= 2) lastSeekCorrectionRef.current = null
+      return false
+    }
+    remoteApplyRef.current = true
+    window.clearTimeout(remoteApplyTimerRef.current)
+    remoteApplyTimerRef.current = window.setTimeout(() => { remoteApplyRef.current = false }, 1800)
+    player.seekTo(targetTime, true)
+    lastSeekCorrectionRef.current = correction
+    return true
   }
 
   function applyVideoState(state) {
@@ -138,17 +168,19 @@ export default function WatchRoomPage({ socket, connection }) {
     pendingVideoStateRef.current = state
     if (!state.videoId) return
     setActiveVideoId(state.videoId)
-    setPlayerStatus('loading')
+    const isVideoChange = currentPlayerVideoRef.current !== state.videoId
+    if (isVideoChange || !playerReadyRef.current) setPlayerStatus('loading')
     setVideoError('')
     const player = playerRef.current
     if (!player || !playerReadyRef.current || !player.getIframe?.()) return
     remoteApplyRef.current = true
     window.clearTimeout(remoteApplyTimerRef.current)
     remoteApplyTimerRef.current = window.setTimeout(() => { remoteApplyRef.current = false }, 1800)
-    if (currentPlayerVideoRef.current !== state.videoId) {
+    if (isVideoChange) {
       captureLocalAudio(player)
       localAudioNeedsRestoreRef.current = true
       currentPlayerVideoRef.current = state.videoId
+      lastSeekCorrectionRef.current = null
       const options = { videoId: state.videoId, startSeconds: Math.max(0, state.currentTime || 0) }
       if (state.playing) player.loadVideoById(options)
       else player.cueVideoById(options)
@@ -161,12 +193,12 @@ export default function WatchRoomPage({ socket, connection }) {
       return
     }
     const targetTime = Math.max(0, state.currentTime || 0)
-    const shouldSeek = Math.abs((player.getCurrentTime?.() || 0) - targetTime) > 1.25
     const playerState = player.getPlayerState?.()
-    const shouldPlay = state.playing && playerState !== 1 && playerState !== 3
-    const shouldPause = !state.playing && playerState !== 2
+    if (playerState === 3) return
+    const shouldSeek = seekToTarget(player, state.videoId, targetTime)
+    const shouldPlay = state.playing && playerState !== 1
+    const shouldPause = !state.playing && playerState !== 2 && playerState !== 5 && playerState !== 0
     if (shouldSeek || shouldPlay || shouldPause) {
-      if (shouldSeek) player.seekTo(targetTime, true)
       if (shouldPlay) player.playVideo()
       if (shouldPause) player.pauseVideo()
     }
@@ -238,9 +270,8 @@ export default function WatchRoomPage({ socket, connection }) {
               captureLocalAudio(playerRef.current)
             }
             if (!canControlPlaybackRef.current || remoteApplyRef.current || !playerRef.current) return
-            const action = event.data === 1 ? 'play' : event.data === 2 ? 'pause' : null
-            if (!action || lastHostActionRef.current === action) return
-            lastHostActionRef.current = action
+            const action = getPlaybackCommandForPlayerState(event.data, pendingVideoStateRef.current?.playing)
+            if (!action) return
             emitHostControl(action, { currentTime: playerRef.current.getCurrentTime() || 0 })
           },
           onError: (event) => onPlayerError(event.data),
@@ -258,27 +289,33 @@ export default function WatchRoomPage({ socket, connection }) {
   }, [canControlPlayback, activeVideoId])
 
   useEffect(() => {
-    if (!canControlPlayback || !activeVideoId || !playerRef.current) return undefined
-    let previous = { time: playerRef.current.getCurrentTime?.() || 0, at: Date.now() }
+    if (!isHost || !activeVideoId || playerStatus !== 'ready' || !playerReadyRef.current || !playerRef.current) return undefined
+    let previous = { time: playerRef.current.getCurrentTime?.() || 0, at: Date.now(), state: playerRef.current.getPlayerState?.() }
     const timer = window.setInterval(() => {
       const player = playerRef.current
-      if (!player || remoteApplyRef.current) return
+      if (!player || !playerReadyRef.current || remoteApplyRef.current) return
       const now = Date.now()
       const time = player.getCurrentTime?.()
       if (!Number.isFinite(time)) return
       const state = player.getPlayerState?.()
-      const expected = previous.time + (state === 1 ? (now - previous.at) / 1000 : 0)
-      if (Math.abs(time - expected) > 1.5) {
+      if (![1, 2].includes(state)) {
+        previous = { time, at: now, state }
+        return
+      }
+      const resumedFromBuffer = previous.state === 3
+      const expected = previous.time + (previous.state === 1 && state === 1 ? (now - previous.at) / 1000 : 0)
+      if (!resumedFromBuffer && Math.abs(time - expected) > 2) {
         emitHostControl('seek', { currentTime: time })
+        lastSeekCorrectionRef.current = null
         lastHostTimeRef.current = { time, at: now }
       } else if (now - lastHostTimeRef.current.at > 5000) {
-        emitHostControl('sync_state', { currentTime: time, playing: state === 1 || (state === 3 && lastHostActionRef.current === 'play') })
+        emitHostControl('sync_state', { currentTime: time, playing: state === 1 })
         lastHostTimeRef.current = { time, at: now }
       }
-      previous = { time, at: now }
+      previous = { time, at: now, state }
     }, 500)
     return () => window.clearInterval(timer)
-  }, [canControlPlayback, activeVideoId, socket])
+  }, [isHost, activeVideoId, playerStatus, socket])
 
   useEffect(() => {
     if (!activeVideoId || playerStatus !== 'ready') return undefined
@@ -292,17 +329,20 @@ export default function WatchRoomPage({ socket, connection }) {
       const player = playerRef.current
       const state = pendingVideoStateRef.current
       if (!player || !state?.videoId || state.videoId !== activeVideoId) return
-      const expectedTime = state.currentTime + (state.playing ? Math.max(0, (Date.now() - state.updatedAt) / 1000) : 0)
+      if (!playerReadyRef.current) return
       const playerState = player.getPlayerState?.()
+      if (playerState === 3) return
+      const expectedTime = state.currentTime + (state.playing ? Math.max(0, (Date.now() - state.updatedAt) / 1000) : 0)
       const time = player.getCurrentTime?.()
       if (!Number.isFinite(time)) return
-      const shouldPlay = state.playing && playerState !== 1 && playerState !== 3
-      const shouldPause = !state.playing && playerState !== 2 && playerState !== 5
-      if (Math.abs(time - expectedTime) <= 1.25 && !shouldPlay && !shouldPause) return
+      const shouldSeek = seekToTarget(player, state.videoId, expectedTime)
+      const shouldPlay = state.playing && playerState !== 1
+      const shouldPause = !state.playing && playerState !== 2 && playerState !== 5 && playerState !== 0
+      if (!shouldSeek && !shouldPlay && !shouldPause) return
       remoteApplyRef.current = true
       window.clearTimeout(remoteApplyTimerRef.current)
       remoteApplyTimerRef.current = window.setTimeout(() => { remoteApplyRef.current = false }, 1800)
-      if (Math.abs(time - expectedTime) > 1.25) player.seekTo(expectedTime, true)
+      // seekToTarget already applies the drift threshold and cooldown.
       if (shouldPlay) player.playVideo()
       if (shouldPause) player.pauseVideo()
     }, 300)
@@ -592,7 +632,7 @@ export default function WatchRoomPage({ socket, connection }) {
         }
         setActiveVideoId(videoId)
         setVideoError('')
-        lastHostActionRef.current = 'pause'
+        lastSeekCorrectionRef.current = null
         currentPlayerVideoRef.current = ''
         pendingVideoStateRef.current = result.videoState
         try { await ensurePlayer(videoId, result.videoState) }
