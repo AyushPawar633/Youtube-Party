@@ -1,0 +1,19 @@
+{
+  "name": "@youtube-watch-party/client",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build --configLoader runner",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^4.7.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-router-dom": "^7.18.4",
+    "socket.io-client": "^4.8.1",
+    "vite": "^6.3.5"
+  }
+}

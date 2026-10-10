@@ -1,0 +1,32 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+npm-debug.log*
+
+# Local credentials and private keys
+.npmrc
+secrets/
+.ssh/
+*.pem
+*.key
+*.p12
+*.pfx
+*.ppk
+*.p8
+*.secret
+*.secret.*
+*credentials*.json
+*service-account*.json
+*credentials*.yaml
+*credentials*.yml
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+
+# Generated logs and operating-system files
+*.log
+.DS_Store
+Thumbs.db
