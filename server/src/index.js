@@ -460,7 +460,7 @@ io.on('connection', (socket) => {
 })
 
 if (process.env.NODE_ENV !== 'test') {
-  server.listen(port, () => {
+  server.listen(port, '0.0.0.0', () => {
     console.log(`API and Socket.IO listening on port ${port}`)
   })
 }
